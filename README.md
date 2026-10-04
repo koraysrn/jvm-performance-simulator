@@ -1,102 +1,213 @@
 # JVM Performance Simulator
 
-An end-to-end batch pipeline that reads a large (10M+ line) CSV/log file in chunks,
-processes it with **Java 21 Virtual Threads** and **StructuredTaskScope**, and writes
-the results asynchronously with strictly bounded memory.
+[![CI](https://github.com/koraysrn/jvm-performance-simulator/actions/workflows/ci.yml/badge.svg)](https://github.com/koraysrn/jvm-performance-simulator/actions/workflows/ci.yml)
+[![Java](https://img.shields.io/badge/Java-21-ED8B00?logo=openjdk&logoColor=white)](https://openjdk.org/projects/jdk/21/)
+[![Maven](https://img.shields.io/badge/Maven-3.9-C71A36?logo=apache-maven&logoColor=white)](https://maven.apache.org/)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-## Highlights
+A high-throughput batch processor that streams **10M+ line CSV/log files** through a
+chunked pipeline powered by **Java 21 Virtual Threads** and **Structured Concurrency**,
+with **bounded memory**, **backpressure** and **immutable Records** — verified end-to-end
+under a fixed `-Xmx256m` heap.
 
-- **Virtual Threads + Structured Concurrency** — every stage (reader, workers, writer)
-  runs as a subtask of a single `StructuredTaskScope.ShutdownOnFailure`.
-- **Bounded memory / backpressure** — fixed-capacity `ArrayBlockingQueue`s propagate
-  backpressure from the writer all the way back to the reader.
+## Table of Contents
+
+- [JVM Performance Simulator](#jvm-performance-simulator)
+  - [Table of Contents](#table-of-contents)
+  - [Features](#features)
+  - [Architecture](#architecture)
+  - [Requirements](#requirements)
+  - [Getting Started](#getting-started)
+  - [Usage](#usage)
+  - [CLI Options](#cli-options)
+  - [Input \& Output Format](#input--output-format)
+  - [Memory Model](#memory-model)
+  - [Testing](#testing)
+  - [Project Structure](#project-structure)
+  - [Tech Stack](#tech-stack)
+  - [Roadmap](#roadmap)
+  - [License](#license)
+
+## Features
+
+- **Virtual Threads & Structured Concurrency** — every stage (readers, merger, workers,
+  writer) runs as a subtask of a single `StructuredTaskScope.ShutdownOnFailure`; no
+  traditional thread pools.
+- **Parallel byte-offset reading** — the file is split into line-boundary-aligned byte
+  ranges scanned by multiple readers in parallel.
+- **Bounded memory & backpressure** — every queue is a fixed-capacity
+  `ArrayBlockingQueue`, so a slow stage blocks its producers instead of buffering
+  unboundedly.
 - **Immutable DTOs** — all cross-thread data objects are Java `record`s.
-- **Spec-Driven Development** — [`intent.md`](intent.md), [`spec.md`](spec.md) and
-  [`CLAUDE.md`](CLAUDE.md) are the single source of truth; ArchUnit enforces them in CI.
+- **Ordered, single-writer output** — one async writer emits results in input order,
+  with optional GZIP compression.
+- **Overflow-safe aggregation** — `Math.addExact` guards the count and `double`
+  semantics are explicit for sum/min/max/average.
+- **Security hardening** — CSV formula-injection (CWE-1236) and log-injection
+  (CWE-117) protection built in.
+- **Spec-Driven Development guardrails** — [`intent.md`](intent.md),
+  [`spec.md`](spec.md) and [`CLAUDE.md`](CLAUDE.md) are the single source of truth,
+  enforced by ArchUnit tests in CI.
+- **Observability** — Micrometer metrics and throughput reporting.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    A["Input CSV<br/>10M+ lines"] --> B["ByteRangePartitioner<br/>line-aligned byte ranges"]
+    B --> C1["Reader 1<br/>(virtual thread)"]
+    B --> C2["Reader 2<br/>(virtual thread)"]
+    B --> CN["Reader N<br/>(virtual thread)"]
+    C1 --> D["Ordered Merger<br/>(bounded queues)"]
+    C2 --> D
+    CN --> D
+    D --> E["Worker Pool<br/>parse → filter → transform → aggregate"]
+    E --> F["AsyncWriter<br/>ordered, single stream"]
+    F --> G["Output CSV / CSV.gz"]
+```
 
 ## Requirements
 
-- JDK 21 (e.g. Eclipse Temurin 21)
-- Maven 3.9+
+- **JDK 21** (e.g. Eclipse Temurin)
+- **Maven 3.9+**
 
-The build enables preview features (`StructuredTaskScope`, `ScopedValue`) via
-`--enable-preview` for both compilation and tests.
+The build enables Java 21 preview features (`StructuredTaskScope`, `ScopedValue`) for
+both compilation and tests.
 
-## Build and test
+## Getting Started
 
 ```bash
+git clone https://github.com/koraysrn/jvm-performance-simulator.git
+cd jvm-performance-simulator
+
+# Compile, run all tests, enforce ArchUnit rules and the coverage gate
 mvn clean verify
 ```
 
-This runs all unit/integration tests plus ArchUnit architecture checks and enforces a
-minimum 50% line-coverage gate. The heavy 10M-line memory stress test is tagged `stress`
-and excluded by default.
-
-## Run
+## Usage
 
 ```bash
 mvn package
-java --enable-preview -cp target/jvm-performance-simulator-1.0.0-SNAPSHOT.jar \
-     com.jvmsim.Main --input data/input.csv --output data/output.csv
+
+java --enable-preview \
+  -cp target/jvm-performance-simulator-1.0.0-SNAPSHOT.jar \
+  com.jvmsim.Main \
+  --input data/input.csv \
+  --output data/output.csv
 ```
 
-Alternatively, use `exec` with preview enabled:
+Filter to ERROR/WARN records, scale values and compress the output:
 
 ```bash
-mvn compile exec:java \
-  -Dexec.mainClass=com.jvmsim.Main \
-  -Dexec.args="--input data/input.csv --output data/output.csv"
+java --enable-preview \
+  -cp target/jvm-performance-simulator-1.0.0-SNAPSHOT.jar \
+  com.jvmsim.Main \
+  --input data/input.csv \
+  --output data/output.csv.gz \
+  --level ERROR,WARN \
+  --value-scale 0.5 \
+  --gzip
 ```
 
-### Options
+## CLI Options
 
-| Option                | Default | Description                                      |
-|-----------------------|---------|--------------------------------------------------|
-| `-i`, `--input`       | —       | Input CSV file path (required)                   |
-| `-o`, `--output`      | —       | Output CSV file path (required)                  |
-| `--chunk-size`        | 5000    | Raw lines per chunk                              |
-| `--workers`           | 8       | Worker virtual threads                           |
-| `--queue-capacity`    | 32      | Bounded queue capacity (backpressure)            |
-| `--gzip`              | false   | GZIP-compress the output                         |
-| `--fail-fast`         | false   | Abort on the first malformed line                |
-| `--level`             | —       | Comma-separated accepted levels (e.g. ERROR,WARN)|
-| `--source`            | —       | Comma-separated accepted sources                 |
-| `--min-value`         | —       | Inclusive lower bound for the numeric value      |
-| `--max-value`         | —       | Inclusive upper bound for the numeric value      |
-| `--value-scale`       | —       | Multiplication factor applied to values          |
-| `--deadline-seconds`  | 0       | Whole-run deadline (0 = no deadline)             |
+| Option               | Default | Description                                      |
+|----------------------|---------|--------------------------------------------------|
+| `-i`, `--input`      | —       | Input CSV file path (required)                   |
+| `-o`, `--output`     | —       | Output CSV file path (required)                  |
+| `--chunk-size`       | 2000    | Raw lines per chunk                              |
+| `--workers`          | 8       | Worker virtual threads (also reader count)       |
+| `--queue-capacity`   | 32      | Bounded queue capacity (backpressure)            |
+| `--gzip`             | false   | GZIP-compress the output                         |
+| `--fail-fast`        | false   | Abort on the first malformed line                |
+| `--level`            | —       | Comma-separated accepted levels                  |
+| `--source`           | —       | Comma-separated accepted sources                 |
+| `--min-value`        | —       | Inclusive lower bound for the numeric value      |
+| `--max-value`        | —       | Inclusive upper bound for the numeric value      |
+| `--value-scale`      | —       | Multiplication factor applied to values          |
+| `--deadline-seconds` | 0       | Whole-run deadline (0 = no deadline)             |
 
-## Input format
+## Input & Output Format
 
-Five-column CSV: `timestamp, level, source, message, value`. See
-[`spec.md`](spec.md) for the full contract and the memory-budget rule.
+Five-column CSV: `timestamp, level, source, message, value`.
 
-## Memory stress gate
+```csv
+2026-10-04T20:00:00Z,INFO,auth-service,login ok,42.5
+2026-10-04T20:00:01Z,ERROR,gateway,"request failed, timeout",-1.0
+```
 
-The pipeline must process 10 million lines under a fixed 256 MB heap:
+Fields follow RFC-4180 quoting. Blank lines are ignored; malformed lines are skipped and
+counted by default, or abort the run with `--fail-fast`. Output preserves the input order
+of records that passed the filter.
+
+## Memory Model
+
+The pipeline never loads the whole file. The maximum number of live raw lines is
+bounded by:
+
+```
+live lines ≈ chunkSize × (queueCapacity × (workerCount + 1) + workerCount)
+```
+
+With the defaults (`2000 × (32 × 9 + 8) = 592k` lines) the resident data stays well
+below `-Xmx256m`. The 10M-line stress test enforces this budget in CI.
+
+## Testing
 
 ```bash
+# Unit, integration, ArchUnit and coverage (stress tests excluded by default)
+mvn clean verify
+
+# Memory stress gate: 10M lines under -Xmx256m
 mvn test -Dtest=MemoryStressTest -Dsurefire.excludedGroups=__none__
-```
 
-Lower the line count for a quick local check:
-
-```bash
+# Quick local stress check with fewer lines
 mvn test -Dtest=MemoryStressTest -Dsurefire.excludedGroups=__none__ -Dstress.lines=100000
 ```
 
-## Project layout
+Coverage report: `target/site/jacoco/index.html`.
 
-- `src/main/java/com/jvmsim/model` — immutable records (DTOs)
-- `src/main/java/com/jvmsim/io` — chunked reader
-- `src/main/java/com/jvmsim/parse` — CSV parser + malformed-line policy
-- `src/main/java/com/jvmsim/process` — filter, transformer, aggregator, chunk processor
-- `src/main/java/com/jvmsim/concurrent` — `StructuredTaskScope` orchestrator
-- `src/main/java/com/jvmsim/output` — ordered asynchronous writer
-- `src/main/java/com/jvmsim/metrics` — Micrometer summary metrics
-- `src/main/java/com/jvmsim/cli` — picocli command bootstrap
-- `src/test/java` — unit, integration, ArchUnit and stress tests
+## Project Structure
 
-## Future work
+```
+src/main/java/com/jvmsim/
+├── model/       immutable Record DTOs
+├── io/          ByteRangePartitioner, RangeChunkReader, ChunkReader
+├── parse/       CsvParser + malformed-line policy
+├── process/     filter, transformer, aggregator, chunk processor
+├── concurrent/  StructuredTaskScope orchestrator
+├── output/      ordered asynchronous writer
+├── metrics/     Micrometer summary metrics
+├── config/      immutable pipeline configuration
+└── cli/         picocli command bootstrap
 
-See [`docs/extra-features.md`](docs/extra-features.md) for the planned feature roadmap.
+src/test/java/com/jvmsim/
+├── arch/        ArchUnit architecture rules
+├── concurrent/  orchestrator + memory stress tests
+├── io/          reader/partitioner tests
+├── model/       record tests
+├── output/      writer/backpressure tests
+├── parse/       parser edge-case tests
+└── process/     processing unit tests
+```
+
+## Tech Stack
+
+| Layer          | Technology                                   |
+|----------------|----------------------------------------------|
+| Language       | Java 21 (preview: structured concurrency)     |
+| Concurrency    | Virtual Threads, `StructuredTaskScope`, `ScopedValue` |
+| Build          | Maven, Surefire, JaCoCo, ArchUnit             |
+| CLI            | picocli                                      |
+| CSV            | Apache Commons CSV                           |
+| Metrics        | Micrometer                                   |
+| Logging        | SLF4J + Logback                              |
+| CI/CD          | GitHub Actions                               |
+
+## Roadmap
+
+Planned enhancements are tracked in [`docs/extra-features.md`](docs/extra-features.md).
+
+## License
+
+Distributed under the MIT License. See [`LICENSE`](LICENSE) for details.
