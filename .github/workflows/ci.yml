@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      # Compiles with --enable-preview, runs unit/integration/ArchUnit tests,
+      # enforces the JaCoCo coverage gate and excludes the heavy stress tag.
+      - name: Build and test
+        run: mvn --batch-mode --no-transfer-progress clean verify
+
+      # Optional memory gate: proves the pipeline handles 10M lines under -Xmx256m.
+      - name: Memory stress gate (10M lines)
+        run: mvn --batch-mode --no-transfer-progress test \
+               -Dtest=MemoryStressTest -Dsurefire.excludedGroups=__none__
