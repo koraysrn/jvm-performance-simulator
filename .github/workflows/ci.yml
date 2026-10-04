@@ -27,5 +27,4 @@ jobs:
 
       # Optional memory gate: proves the pipeline handles 10M lines under -Xmx256m.
       - name: Memory stress gate (10M lines)
-        run: mvn --batch-mode --no-transfer-progress test \
-               -Dtest=MemoryStressTest -Dsurefire.excludedGroups=__none__
+        run: mvn --batch-mode --no-transfer-progress test -Dtest=MemoryStressTest -Dsurefire.excludedGroups=__none__
